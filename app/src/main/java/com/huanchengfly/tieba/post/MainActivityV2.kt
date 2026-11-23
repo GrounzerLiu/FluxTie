@@ -9,7 +9,10 @@ import android.content.Context
 import android.content.Intent
 import android.graphics.drawable.ColorDrawable
 import android.net.Uri
+import android.animation.ValueAnimator
 import android.os.Build
+import android.view.animation.DecelerateInterpolator
+import androidx.activity.BackEventCompat
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
@@ -29,6 +32,7 @@ import androidx.compose.animation.slideInHorizontally
 import androidx.compose.animation.slideOutHorizontally
 import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxSize
@@ -53,13 +57,16 @@ import androidx.compose.runtime.State
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.compositionLocalOf
 import androidx.compose.runtime.derivedStateOf
+import androidx.compose.animation.core.animate
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableFloatStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.staticCompositionLocalOf
 import androidx.datastore.preferences.core.booleanPreferencesKey
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.unit.IntOffset
@@ -218,6 +225,36 @@ class MainActivityV2 : BaseComposeActivity() {
 
     /** 通知/快捷方式点击待消费的底栏 tab 请求 */
     private val mainTabRequest = MainTabRequestState()
+
+    /**
+     * 预测性返回手势进度（0f~1f）。
+     *
+     * Android 13+ 的预测性返回里，系统只负责把手势进度回传给应用，随手指移动的
+     * 预览动画必须由应用自己绘制；单 Activity + Compose 导航的应用若不自绘，
+     * 侧滑时就只剩系统一个生硬的窗口缩放，看起来"没有效果"。
+     */
+    private val predictiveBackProgress = mutableFloatStateOf(0f)
+
+    /** 合成预览动画：部分 ROM（如 ColorOS 17）只回调 start/invoke，进度恒为 0 */
+    private var backProgressAnimator: ValueAnimator? = null
+
+    private fun animateBackProgressTo(target: Float, durationMs: Long = 180L) {
+        val from = predictiveBackProgress.floatValue
+        if (from == target && backProgressAnimator == null) return
+        backProgressAnimator?.cancel()
+        backProgressAnimator = ValueAnimator.ofFloat(from, target).apply {
+            duration = durationMs
+            interpolator = DecelerateInterpolator()
+            addUpdateListener { predictiveBackProgress.floatValue = it.animatedValue as Float }
+            start()
+        }
+    }
+
+    private fun startSyntheticBackPreview() {
+        animateBackProgressTo(0.45f, 160L)
+    }
+
+
 
     private val pickMediasLauncher =
         registerPickMediasLauncher {
@@ -609,6 +646,30 @@ class MainActivityV2 : BaseComposeActivity() {
                 )
             }
         }
+        // 组合期读取进度：保证进度变化一定触发重组与重绘
+        val backProgress = predictiveBackProgress.floatValue
+        Box(
+            modifier = Modifier
+                .fillMaxSize()
+                .graphicsLayer {
+                    val progress = backProgress
+                    if (progress > 0f) {
+                        val scale = 1f - 0.10f * progress
+                        scaleX = scale
+                        scaleY = scale
+                        translationX = size.width * 0.30f * progress
+                        shape = RoundedCornerShape((26f * progress).dp)
+                        clip = true
+                        alpha = 1f - 0.15f * progress
+                    } else {
+                        scaleX = 1f
+                        scaleY = 1f
+                        translationX = 0f
+                        clip = false
+                        alpha = 1f
+                    }
+                }
+        ) {
         TiebaLiteLocalProvider {
             TranslucentThemeBackground {
                 val navController = rememberNavController()
@@ -627,6 +688,7 @@ class MainActivityV2 : BaseComposeActivity() {
                     key = booleanPreferencesKey("predictive_back"),
                     defaultValue = true
                 )
+                val backDispatcher = LocalOnBackPressedDispatcherOwner.current
                 if (!predictiveBack) {
                     val backDispatcher = LocalOnBackPressedDispatcherOwner.current
                     val backCallback = remember(navController) {
@@ -670,7 +732,64 @@ class MainActivityV2 : BaseComposeActivity() {
                 SideEffect {
                     myNavController = navController
                 }
+
+                // 预测性返回预览：把本回调注册在 NavHost 之后，成为导航级返回的最上层回调。
+                // 手势进度用于驱动内容层跟手位移；确认返回时不自行弹栈，而是把自己临时
+                // 关掉再交给 OnBackPressedDispatcher，页面内 BackHandler / 对话框语义不变。
+                DisposableEffect(backDispatcher, predictiveBack) {
+                    if (!predictiveBack) {
+                        onDispose { }
+                    } else {
+                        val previewCallback = object : OnBackPressedCallback(true) {
+                            override fun handleOnBackStarted(backEvent: BackEventCompat) {
+                                if (BuildConfig.DEBUG) {
+                                    android.util.Log.d("FluxTieBack", "started")
+                                }
+                                predictiveBackProgress.floatValue = 0f
+                                // 系统若只回调 start 不给进度（ColorOS 17 实测），
+                                // 用一个短动画给出"起手势"的视觉反馈
+                                startSyntheticBackPreview()
+                            }
+
+                            override fun handleOnBackProgressed(backEvent: BackEventCompat) {
+                                if (BuildConfig.DEBUG) {
+                                    android.util.Log.d(
+                                        "FluxTieBack",
+                                        "progressed p=${backEvent.progress} " +
+                                            "x=${backEvent.touchX} y=${backEvent.touchY} " +
+                                            "edge=${backEvent.swipeEdge}"
+                                    )
+                                }
+                                if (backEvent.progress > 0f) {
+                                    backProgressAnimator?.cancel()
+                                    predictiveBackProgress.floatValue =
+                                        backEvent.progress.coerceIn(0f, 1f)
+                                }
+                            }
+
+                            override fun handleOnBackCancelled() {
+                                animateBackProgressTo(0f)
+                            }
+
+                            override fun handleOnBackPressed() {
+                                if (BuildConfig.DEBUG) {
+                                    android.util.Log.d("FluxTieBack", "invoked")
+                                }
+                                predictiveBackProgress.floatValue = 0f
+                                isEnabled = false
+                                backDispatcher?.onBackPressedDispatcher?.onBackPressed()
+                                isEnabled = true
+                            }
+                        }
+                        backDispatcher?.onBackPressedDispatcher?.addCallback(
+                            backDispatcher,
+                            previewCallback
+                        )
+                        onDispose { previewCallback.remove() }
+                    }
+                }
             }
+        }
         }
 
         AppSplashOverlay()
